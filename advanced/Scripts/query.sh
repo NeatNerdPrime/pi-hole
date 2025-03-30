@@ -1,262 +1,157 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 # shellcheck disable=SC1090
+
+# Ignore warning about `local` being undefinded in POSIX
+# shellcheck disable=SC3043
+# https://github.com/koalaman/shellcheck/wiki/SC3043#exceptions
+
 # Pi-hole: A black hole for Internet advertisements
-# (c) 2018 Pi-hole, LLC (https://pi-hole.net)
+# (c) 2023 Pi-hole, LLC (https://pi-hole.net)
 # Network-wide ad blocking via your own hardware.
 #
-# Query Domain Lists
+# Search Adlists
 #
 # This file is copyright under the latest version of the EUPL.
 # Please see LICENSE file for your rights under this license.
 
 # Globals
-piholeDir="/etc/pihole"
-gravityDBfile="${piholeDir}/gravity.db"
-options="$*"
-adlist=""
-all=""
-exact=""
-blockpage=""
-matchType="match"
+PI_HOLE_INSTALL_DIR="/opt/pihole"
+max_results="20"
+partial="false"
+domain=""
 
+# Source color table
 colfile="/opt/pihole/COL_TABLE"
-source "${colfile}"
+. "${colfile}"
 
-# Scan an array of files for matching strings
-scanList(){
-    # Escape full stops
-    local domain="${1}" esc_domain="${1//./\\.}" lists="${2}" type="${3:-}"
+# Source api functions
+. "${PI_HOLE_INSTALL_DIR}/api.sh"
 
-    # Prevent grep from printing file path
-    cd "$piholeDir" || exit 1
-
-    # Prevent grep -i matching slowly: http://bit.ly/2xFXtUX
-    export LC_CTYPE=C
-
-    # /dev/null forces filename to be printed when only one list has been generated
-    # shellcheck disable=SC2086
-    case "${type}" in
-        "exact" ) grep -i -E -l "(^|(?<!#)\\s)${esc_domain}($|\\s|#)" ${lists} /dev/null 2>/dev/null;;
-        # Create array of regexps
-        # Iterate through each regexp and check whether it matches the domainQuery
-        # If it does, print the matching regexp and continue looping
-        # Input 1 - regexps | Input 2 - domainQuery
-        "regex" ) awk 'NR==FNR{regexps[$0];next}{for (r in regexps)if($0 ~ r)print r}' \
-                  <(echo "${lists}") <(echo "${domain}") 2>/dev/null;;
-        *       ) grep -i "${esc_domain}" ${lists} /dev/null 2>/dev/null;;
-    esac
-}
-
-if [[ "${options}" == "-h" ]] || [[ "${options}" == "--help" ]]; then
+Help() {
     echo "Usage: pihole -q [option] <domain>
-Example: 'pihole -q -exact domain.com'
+Example: 'pihole -q --partial domain.com'
 Query the adlists for a specified domain
 
 Options:
-  -adlist             Print the name of the block list URL
-  -exact              Search the block lists for exact domain matches
-  -all                Return all query matches within a block list
-  -h, --help          Show this help dialog"
-  exit 0
-fi
-
-# Handle valid options
-if [[ "${options}" == *"-bp"* ]]; then
-    exact="exact"; blockpage=true
-else
-    [[ "${options}" == *"-adlist"* ]] && adlist=true
-    [[ "${options}" == *"-all"* ]] && all=true
-    if [[ "${options}" == *"-exact"* ]]; then
-        exact="exact"; matchType="exact ${matchType}"
-    fi
-fi
-
-# Strip valid options, leaving only the domain and invalid options
-# This allows users to place the options before or after the domain
-options=$(sed -E 's/ ?-(bp|adlists?|all|exact) ?//g' <<< "${options}")
-
-# Handle remaining options
-# If $options contain non ASCII characters, convert to punycode
-case "${options}" in
-    ""             ) str="No domain specified";;
-    *" "*          ) str="Unknown query option specified";;
-    *[![:ascii:]]* ) domainQuery=$(idn2 "${options}");;
-    *              ) domainQuery="${options}";;
-esac
-
-if [[ -n "${str:-}" ]]; then
-    echo -e "${str}${COL_NC}\\nTry 'pihole -q --help' for more information."
-    exit 1
-fi
-
-scanDatabaseTable() {
-    local domain table type querystr result
-    domain="$(printf "%q" "${1}")"
-    table="${2}"
-    type="${3:-}"
-
-    # As underscores are legitimate parts of domains, we escape them when using the LIKE operator.
-    # Underscores are SQLite wildcards matching exactly one character. We obviously want to suppress this
-    # behavior. The "ESCAPE '\'" clause specifies that an underscore preceded by an '\' should be matched
-    # as a literal underscore character. We pretreat the $domain variable accordingly to escape underscores.
-    case "${type}" in
-        "exact" ) querystr="SELECT domain FROM vw_${table} WHERE domain = '${domain}'";;
-        *       ) querystr="SELECT domain FROM vw_${table} WHERE domain LIKE '%${domain//_/\\_}%' ESCAPE '\\'";;
-    esac
-
-    # Send prepared query to gravity database
-    result="$(sqlite3 "${gravityDBfile}" "${querystr}")" 2> /dev/null
-    if [[ -z "${result}" ]]; then
-        # Return early when there are no matches in this table
-        return
-    fi
-
-    # Mark domain as having been white-/blacklist matched (global variable)
-    wbMatch=true
-
-    # Print table name
-    if [[ -z "${blockpage}" ]]; then
-        echo " ${matchType^} found in ${COL_BOLD}${table^}${COL_NC}"
-    fi
-
-    # Loop over results and print them
-    mapfile -t results <<< "${result}"
-    for result in "${results[@]}"; do
-        if [[ -n "${blockpage}" ]]; then
-            echo "π ${result}"
-            exit 0
-        fi
-        echo "   ${result}"
-    done
+  --partial            Search the adlists for partially matching domains
+  --all                Return all query matches within the adlists
+  -h, --help           Show this help dialog"
+    exit 0
 }
 
-scanRegexDatabaseTable() {
-    local domain list
-    domain="${1}"
-    list="${2}"
+GenerateOutput() {
+    local data gravity_data lists_data num_gravity num_lists search_type_str
+    local gravity_data_csv lists_data_csv line current_domain url type color
+    data="${1}"
 
-    # Query all regex from the corresponding database tables
-    mapfile -t regexList < <(sqlite3 "${gravityDBfile}" "SELECT domain FROM vw_regex_${list}" 2> /dev/null)
+    # construct a new json for the list results where each object contains the domain and the related type
+    lists_data=$(printf %s "${data}" | jq '.search.domains | [.[] | {domain: .domain, type: .type}]')
 
-    # If we have regexps to process
-    if [[ "${#regexList[@]}" -ne 0 ]]; then
-        # Split regexps over a new line
-        str_regexList=$(printf '%s\n' "${regexList[@]}")
-        # Check domain against regexps
-        mapfile -t regexMatches < <(scanList "${domain}" "${str_regexList}" "regex")
-        # If there were regex matches
-        if [[  "${#regexMatches[@]}" -ne 0 ]]; then
-            # Split matching regexps over a new line
-            str_regexMatches=$(printf '%s\n' "${regexMatches[@]}")
-            # Form a "matched" message
-            str_message="${matchType^} found in ${COL_BOLD}Regex ${list}${COL_NC}"
-            # Form a "results" message
-            str_result="${COL_BOLD}${str_regexMatches}${COL_NC}"
-            # If we are displaying more than just the source of the block
-            if [[ -z "${blockpage}" ]]; then
-                # Set the wildcard match flag
-                wcMatch=true
-                # Echo the "matched" message, indented by one space
-                echo " ${str_message}"
-                # Echo the "results" message, each line indented by three spaces
-                # shellcheck disable=SC2001
-                echo "${str_result}" | sed 's/^/   /'
-            else
-                echo "π .wildcard"
-                exit 0
-            fi
-        fi
-    fi
-}
+    # construct a new json for the gravity results where each object contains the adlist URL and the related domains
+    gravity_data=$(printf %s "${data}" | jq '.search.gravity  | group_by(.address,.type) | map({ address: (.[0].address), type: (.[0].type), domains: [.[] | .domain] })')
 
-# Scan Whitelist and Blacklist
-scanDatabaseTable "${domainQuery}" "whitelist" "${exact}"
-scanDatabaseTable "${domainQuery}" "blacklist" "${exact}"
+    # number of objects in each json
+    num_gravity=$(printf %s "${gravity_data}" | jq length)
+    num_lists=$(printf %s "${lists_data}" | jq length)
 
-# Scan Regex table
-scanRegexDatabaseTable "${domainQuery}" "whitelist"
-scanRegexDatabaseTable "${domainQuery}" "blacklist"
-
-# Get version sorted *.domains filenames (without dir path)
-lists=("$(cd "$piholeDir" || exit 0; printf "%s\\n" -- *.domains | sort -V)")
-
-# Query blocklists for occurences of domain
-mapfile -t results <<< "$(scanList "${domainQuery}" "${lists[*]}" "${exact}")"
-
-# Remove unwanted content from $results
-# Each line in $results is formatted as such: [fileName]:[line]
-# 1. Delete lines starting with #
-# 2. Remove comments after domain
-# 3. Remove hosts format IP address
-# 4. Remove any lines that no longer contain the queried domain name (in case the matched domain name was in a comment)
-esc_domain="${domainQuery//./\\.}"
-mapfile -t results <<< "$(IFS=$'\n'; sed \
-	-e "/:#/d" \
-	-e "s/[ \\t]#.*//g" \
-	-e "s/:.*[ \\t]/:/g" \
-	-e "/${esc_domain}/!d" \
-	<<< "${results[*]}")"
-
-# Handle notices
-if [[ -z "${wbMatch:-}" ]] && [[ -z "${wcMatch:-}" ]] && [[ -z "${results[*]}" ]]; then
-    echo -e "  ${INFO} No ${exact/t/t }results found for ${COL_BOLD}${domainQuery}${COL_NC} within the block lists"
-    exit 0
-elif [[ -z "${results[*]}" ]]; then
-    # Result found in WL/BL/Wildcards
-    exit 0
-elif [[ -z "${all}" ]] && [[ "${#results[*]}" -ge 100 ]]; then
-    echo -e "  ${INFO} Over 100 ${exact/t/t }results found for ${COL_BOLD}${domainQuery}${COL_NC}
-        This can be overridden using the -all option"
-    exit 0
-fi
-
-# Get adlist file content as array
-if [[ -n "${adlist}" ]] || [[ -n "${blockpage}" ]]; then
-    # Retrieve source URLs from gravity database
-    mapfile -t adlists <<< "$(sqlite3 "${gravityDBfile}" "SELECT address FROM vw_adlist;" 2> /dev/null)"
-fi
-
-# Print "Exact matches for" title
-if [[ -n "${exact}" ]] && [[ -z "${blockpage}" ]]; then
-    plural=""; [[ "${#results[*]}" -gt 1 ]] && plural="es"
-    echo " ${matchType^}${plural} for ${COL_BOLD}${domainQuery}${COL_NC} found in:"
-fi
-
-for result in "${results[@]}"; do
-    fileName="${result/:*/}"
-
-    # Determine *.domains URL using filename's number
-    if [[ -n "${adlist}" ]] || [[ -n "${blockpage}" ]]; then
-        fileNum="${fileName/list./}"; fileNum="${fileNum%%.*}"
-        fileName="${adlists[$fileNum]}"
-
-        # Discrepency occurs when adlists has been modified, but Gravity has not been run
-        if [[ -z "${fileName}" ]]; then
-            fileName="${COL_LIGHT_RED}(no associated adlists URL found)${COL_NC}"
-        fi
-    fi
-
-    if [[ -n "${blockpage}" ]]; then
-        echo "${fileNum} ${fileName}"
-    elif [[ -n "${exact}" ]]; then
-        echo "   ${fileName}"
+    if [ "${partial}" = true ]; then
+        search_type_str="partially"
     else
-        if [[ ! "${fileName}" == "${fileName_prev:-}" ]]; then
-            count=""
-            echo " ${matchType^} found in ${COL_BOLD}${fileName}${COL_NC}:"
-            fileName_prev="${fileName}"
-        fi
-        : $((count++))
-
-        # Print matching domain if $max_count has not been reached
-        [[ -z "${all}" ]] && max_count="50"
-        if [[ -z "${all}" ]] && [[ "${count}" -ge "${max_count}" ]]; then
-            [[ "${count}" -gt "${max_count}" ]] && continue
-            echo "   ${COL_GRAY}Over ${count} results found, skipping rest of file${COL_NC}"
-        else
-            echo "   ${result#*:}"
-        fi
+        search_type_str="exactly"
     fi
+
+    # Results from allow/deny list
+    printf "%s\n\n" "Found ${num_lists} domains ${search_type_str} matching '${COL_BLUE}${domain}${COL_NC}'."
+    if [ "${num_lists}" -gt 0 ]; then
+        # Convert the data to a csv, each line is a "domain,type" string
+        # not using jq's @csv here as it quotes each value individually
+        lists_data_csv=$(printf %s "${lists_data}" | jq --raw-output '.[] | [.domain, .type] | join(",")')
+
+        # Generate output for each csv line, separating line in a domain and type substring at the ','
+        echo "${lists_data_csv}" | while read -r line; do
+            printf "%s\n\n" "  - ${COL_GREEN}${line%,*}${COL_NC} (type: exact ${line#*,} domain)"
+        done
+    fi
+
+    # Results from gravity
+    printf "%s\n\n" "Found ${num_gravity} adlists ${search_type_str} matching '${COL_BLUE}${domain}${COL_NC}'."
+    if [ "${num_gravity}" -gt 0 ]; then
+        # Convert the data to a csv, each line is a "URL,domain,domain,...." string
+        # not using jq's @csv here as it quotes each value individually
+        gravity_data_csv=$(printf %s "${gravity_data}" | jq --raw-output '.[] | [.address, .type, .domains[]] | join(",")')
+
+        # Generate line-by-line output for each csv line
+        echo "${gravity_data_csv}" | while read -r line; do
+            # Get first part of the line, the URL
+            url=${line%%,*}
+
+            # cut off URL, leaving "type,domain,domain,...."
+            line=${line#*,}
+            type=${line%%,*}
+            # type == "block" -> red, type == "allow" -> green
+            if [ "${type}" = "block" ]; then
+                color="${COL_RED}"
+            else
+                color="${COL_GREEN}"
+            fi
+
+            # print adlist URL
+            printf "%s (%s)\n\n" "  - ${COL_BLUE}${url}${COL_NC}" "${color}${type}${COL_NC}"
+
+            # cut off type, leaving "domain,domain,...."
+            line=${line#*,}
+            # print each domain and remove it from the string until nothing is left
+            while [ ${#line} -gt 0 ]; do
+                current_domain=${line%%,*}
+                printf '    - %s\n' "${COL_GREEN}${current_domain}${COL_NC}"
+                # we need to remove the current_domain and the comma in two steps because
+                # the last domain won't have a trailing comma and the while loop wouldn't exit
+                line=${line#"${current_domain}"}
+                line=${line#,}
+            done
+            printf "\n\n"
+        done
+    fi
+
+    # If no exact results were found, suggest using partial matching
+    if [ "${num_lists}" -eq 0 ] && [ "${num_gravity}" -eq 0 ] && [ "${partial}" = false ]; then
+        printf "%s\n" "Hint: Try partial matching with"
+        printf "%s\n\n" "  ${COL_GREEN}pihole -q --partial ${domain}${COL_NC}"
+    fi
+}
+
+Main() {
+    local data
+
+    if [ -z "${domain}" ]; then
+        echo "No domain specified"
+        exit 1
+    fi
+    # domains are lowercased and converted to punycode by FTL since
+    # https://github.com/pi-hole/FTL/pull/1715
+    # no need to do it here
+
+    # Authenticate with FTL
+    LoginAPI
+
+    # send query again
+    data=$(GetFTLData "search/${domain}?N=${max_results}&partial=${partial}")
+
+    GenerateOutput "${data}"
+
+    # Delete session
+    LogoutAPI
+}
+
+# Process all options (if present)
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    "-h" | "--help") Help ;;
+    "--partial") partial="true" ;;
+    "--all") max_results=10000 ;; # hard-coded FTL limit
+    *) domain=$1 ;;
+    esac
+    shift
 done
 
-exit 0
+Main "${domain}"
